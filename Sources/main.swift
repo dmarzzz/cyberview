@@ -237,9 +237,23 @@ struct MarkdownRenderer: Renderer {
     static func make(url: URL) -> RenderResult? {
         guard let source = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         let tint = TaskTint(name: url.lastPathComponent)
-        let rendered = render(markdown: source, tint: tint)
+        let baseURL = url.deletingLastPathComponent()
+        var openDetails = Set<Int>()
+        if ProcessInfo.processInfo.environment["CYBERVIEW_EXPAND"] != nil {
+            openDetails = Set(0..<detailsCount(in: source))
+        }
+        let rendered = render(markdown: source, tint: tint, baseURL: baseURL, open: openDetails)
 
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: pageWidth, height: 100))
+        let textView = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: pageWidth, height: 100))
+        textView.source = source
+        textView.tint = tint
+        textView.baseURL = baseURL
+        textView.openDetails = openDetails
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["CYBERVIEW_SELFTEST_CLICK"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { textView.selfTestClickFirstToggle() }
+        }
+        #endif
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false
@@ -272,14 +286,18 @@ struct MarkdownRenderer: Renderer {
         return RenderResult(view: scroll,
                             naturalSize: NSSize(width: pageWidth, height: max(240, contentHeight)),
                             lockAspect: false,
-                            // prose needs contrast the wallpaper would steal
-                            backgroundAlpha: 0.96)
+                            // prose needs contrast the wallpaper would steal; at 0.96 a
+                            // bright page behind the window still ghosted through the text
+                            backgroundAlpha: 0.985)
     }
 
     // AttributedString(markdown:) parses structure into presentation intents;
     // walk the runs and dress them in terminal type: green mono body, tint
     // headings, bright code on dark boxes.
-    static func render(markdown source: String, tint: TaskTint) -> NSAttributedString {
+    static func render(markdown raw: String, tint: TaskTint, baseURL: URL? = nil,
+                       open: Set<Int> = []) -> NSAttributedString {
+        var detailsCounter = 0
+        let source = expandDetails(convertInlineHTML(raw), open: open, counter: &detailsCounter)
         let body = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         let bodyColor = Theme.terminalGreen.withAlphaComponent(0.88)
         let fallback: [NSAttributedString.Key: Any] = [.font: body, .foregroundColor: bodyColor]
@@ -294,7 +312,29 @@ struct MarkdownRenderer: Renderer {
 
         let out = NSMutableAttributedString()
         var lastBlockIDs: [Int]? = nil
-        var lastRowIndex: Int? = nil
+
+        // tables become real NSTextTable grids: one paragraph per cell, blocks
+        // cached per (table, row, column) so inline runs share their cell
+        var tables: [Int: NSTextTable] = [:]
+        var tableRowCounter: [Int: Int] = [:]
+        var tableLastRowKey: [Int: Int] = [:]
+        var cellBlocks: [String: NSTextTableBlock] = [:]
+        var lastWasTable = false
+        var lastWasCode = false
+        var lastMarkedListItem: Int? = nil
+        var headingStart: Int? = nil
+        var slugCounts: [String: Int] = [:]
+
+        // headings carry their GitHub-style slug so "#fragment" links can find them
+        func closeHeading() {
+            guard let start = headingStart, out.length > start else { headingStart = nil; return }
+            let range = NSRange(location: start, length: out.length - start)
+            let base = slug(out.attributedSubstring(from: range).string)
+            let n = slugCounts[base, default: 0]
+            slugCounts[base] = n + 1
+            out.addAttribute(.cvAnchor, value: n == 0 ? base : "\(base)-\(n)", range: range)
+            headingStart = nil
+        }
 
         for run in parsed.runs {
             var text = String(parsed[run.range].characters)
@@ -306,8 +346,13 @@ struct MarkdownRenderer: Renderer {
             var isListItem = false
             var ordered = false
             var ordinal = 0
+            var listDepth = 0
+            var listItemID: Int? = nil
+            var listKindKnown = false
             var cellColumn: Int? = nil
             var rowIndex: Int? = nil
+            var tableID: Int? = nil
+            var tableColumns = 0
             var blockIDs: [Int] = []
 
             if let intent = run.presentationIntent {
@@ -318,8 +363,12 @@ struct MarkdownRenderer: Renderer {
                     case .codeBlock: isCodeBlock = true
                     case .blockQuote: isQuote = true
                     case .thematicBreak: isThematicBreak = true
-                    case .listItem(let o): isListItem = true; ordinal = o
-                    case .orderedList: ordered = true
+                    case .listItem(let o):
+                        listDepth += 1
+                        if !isListItem { isListItem = true; ordinal = o; listItemID = comp.identity }
+                    case .orderedList: if !listKindKnown { ordered = true; listKindKnown = true }
+                    case .unorderedList: if !listKindKnown { ordered = false; listKindKnown = true }
+                    case .table(let cols): tableID = comp.identity; tableColumns = cols.count
                     case .tableCell(let c): cellColumn = c
                     case .tableRow(let r): rowIndex = r
                     case .tableHeaderRow: rowIndex = -1
@@ -330,11 +379,43 @@ struct MarkdownRenderer: Renderer {
 
             // block boundaries
             let newBlock = blockIDs != lastBlockIDs
+            if newBlock { closeHeading() }
             if newBlock, out.length > 0 {
-                if let row = rowIndex, row == lastRowIndex, (cellColumn ?? 0) > 0 {
-                    out.append(NSAttributedString(string: "  │  ", attributes: fallback))
-                } else {
-                    out.append(NSAttributedString(string: "\n", attributes: fallback))
+                out.append(NSAttributedString(string: "\n", attributes: fallback))
+            }
+
+            // resolve this run's table cell block, if any
+            var cellBlock: NSTextTableBlock? = nil
+            let isHeaderCell = rowIndex == -1
+            if let tid = tableID, let col = cellColumn, let rowKey = rowIndex {
+                let table: NSTextTable
+                if let t = tables[tid] { table = t } else {
+                    table = NSTextTable()
+                    table.numberOfColumns = max(tableColumns, 1)
+                    table.layoutAlgorithm = .automaticLayoutAlgorithm
+                    table.collapsesBorders = true
+                    table.hidesEmptyCells = false
+                    tables[tid] = table
+                    tableRowCounter[tid] = 0
+                    tableLastRowKey[tid] = rowKey
+                }
+                if tableLastRowKey[tid] != rowKey {
+                    tableRowCounter[tid, default: 0] += 1
+                    tableLastRowKey[tid] = rowKey
+                }
+                let row = tableRowCounter[tid, default: 0]
+                let key = "\(tid):\(row):\(col)"
+                if let b = cellBlocks[key] { cellBlock = b } else {
+                    let b = NSTextTableBlock(table: table, startingRow: row, rowSpan: 1,
+                                             startingColumn: col, columnSpan: 1)
+                    b.setWidth(0.5, type: .absoluteValueType, for: .border)
+                    b.setBorderColor(tint.frame.withAlphaComponent(0.38))
+                    b.setWidth(5, type: .absoluteValueType, for: .padding)
+                    b.setWidth(8, type: .absoluteValueType, for: .padding, edge: .minX)
+                    b.setWidth(8, type: .absoluteValueType, for: .padding, edge: .maxX)
+                    if isHeaderCell { b.backgroundColor = tint.frame.withAlphaComponent(0.14) }
+                    cellBlocks[key] = b
+                    cellBlock = b
                 }
             }
 
@@ -346,7 +427,6 @@ struct MarkdownRenderer: Renderer {
                                      .foregroundColor: tint.frame.withAlphaComponent(0.4)]))
                 }
                 lastBlockIDs = blockIDs
-                lastRowIndex = rowIndex
                 continue
             }
 
@@ -355,9 +435,20 @@ struct MarkdownRenderer: Renderer {
             para.paragraphSpacing = isCodeBlock ? 2 : 9
             para.lineHeightMultiple = 1.15
             if headingLevel > 0 { para.paragraphSpacingBefore = 10 }
+            if let cellBlock {
+                para.textBlocks = [cellBlock]
+                para.paragraphSpacing = 0
+                para.lineHeightMultiple = 1.1
+            } else if lastWasTable, newBlock {
+                para.paragraphSpacingBefore = max(para.paragraphSpacingBefore, 12)
+            } else if lastWasCode, newBlock, !isCodeBlock {
+                para.paragraphSpacingBefore = max(para.paragraphSpacingBefore, 10)
+            }
             if isListItem || isQuote {
-                para.headIndent = 24
-                para.firstLineHeadIndent = 0
+                // nested lists step in one level per enclosing list item
+                let inset = CGFloat(max(listDepth, 1) - 1) * 22
+                para.headIndent = inset + 24
+                para.firstLineHeadIndent = inset
             }
             if isCodeBlock {
                 para.headIndent = 16
@@ -382,8 +473,12 @@ struct MarkdownRenderer: Renderer {
                 color = NSColor(srgbRed: 0.80, green: 1.0, blue: 0.84, alpha: 1)
                 background = NSColor.black.withAlphaComponent(0.45)
             }
+            if cellBlock != nil {
+                font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+                if isHeaderCell { color = tint.frame }
+            }
 
-            var bold = headingLevel > 0
+            var bold = headingLevel > 0 || (cellBlock != nil && isHeaderCell)
             var italic = isQuote
             if let inline = run.inlinePresentationIntent {
                 if inline.contains(.stronglyEmphasized) { bold = true }
@@ -402,8 +497,9 @@ struct MarkdownRenderer: Renderer {
             }
 
             // list / quote markers on the first run of their block
-            if isListItem, newBlock {
-                let marker = ordered ? "\(ordinal). " : "• "
+            if isListItem, newBlock, listItemID != lastMarkedListItem {
+                lastMarkedListItem = listItemID
+                let marker = ordered ? "\(ordinal). " : (listDepth > 1 ? "◦ " : "• ")
                 out.append(NSAttributedString(string: marker, attributes: [
                     .font: body, .foregroundColor: tint.frame, .paragraphStyle: para]))
             }
@@ -416,19 +512,252 @@ struct MarkdownRenderer: Renderer {
             // code blocks keep their own trailing newline; trim it for spacing
             if isCodeBlock, text.hasSuffix("\n") { text.removeLast() }
 
+            // local images render inline, scaled to the page
+            if let imageURL = run.imageURL {
+                let resolved = imageURL.scheme == nil
+                    ? baseURL?.appendingPathComponent(imageURL.relativeString.removingPercentEncoding
+                                                      ?? imageURL.relativeString)
+                    : (imageURL.isFileURL ? imageURL : nil)
+                if let resolved, let image = NSImage(contentsOf: resolved), image.size.width > 0 {
+                    let maxWidth = pageWidth - 60
+                    let scale = min(1, maxWidth / image.size.width)
+                    let attachment = NSTextAttachment()
+                    attachment.image = image
+                    attachment.bounds = NSRect(x: 0, y: 0, width: image.size.width * scale,
+                                               height: image.size.height * scale)
+                    // a line-height multiple would scale with the image's height
+                    let imagePara = para.mutableCopy() as! NSMutableParagraphStyle
+                    imagePara.lineHeightMultiple = 1
+                    imagePara.paragraphSpacingBefore = 4
+                    let shown = NSMutableAttributedString(attachment: attachment)
+                    shown.addAttribute(.paragraphStyle, value: imagePara,
+                                       range: NSRange(location: 0, length: shown.length))
+                    out.append(shown)
+                    lastBlockIDs = blockIDs
+                    lastWasTable = false
+                    lastWasCode = false
+                    continue
+                }
+            }
+
+            if headingLevel > 0, headingStart == nil { headingStart = out.length }
+
             var attrs: [NSAttributedString.Key: Any] = [
                 .font: font, .foregroundColor: color, .paragraphStyle: para]
             if let background { attrs[.backgroundColor] = background }
-            if let link = run.link { attrs[.link] = link }
+            if let link = run.link, link.scheme == "cyberview-toggle", let id = Int(link.host ?? "") {
+                // <details> disclosure line: click to fold or unfold
+                let closing = link.path == "/close"
+                attrs[.cvToggle] = id
+                attrs[.cursor] = NSCursor.pointingHand
+                attrs[.foregroundColor] = tint.frame.withAlphaComponent(closing ? 0.45 : 1)
+                if !closing, let f = NSFont(descriptor: font.fontDescriptor.withSymbolicTraits(.bold),
+                                           size: font.pointSize) { attrs[.font] = f }
+            } else if let link = run.link { attrs[.link] = link }
             if run.inlinePresentationIntent?.contains(.strikethrough) == true {
                 attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
             }
 
             out.append(NSAttributedString(string: text, attributes: attrs))
             lastBlockIDs = blockIDs
-            lastRowIndex = rowIndex
+            lastWasTable = cellBlock != nil
+            lastWasCode = isCodeBlock
         }
+        closeHeading()
         return out
+    }
+
+    // MARK: HTML that Markdown files lean on
+
+    static func slug(_ heading: String) -> String {
+        let kept = heading.lowercased().unicodeScalars.filter {
+            CharacterSet.alphanumerics.contains($0) || $0 == " " || $0 == "-" || $0 == "_"
+        }
+        return String(String.UnicodeScalarView(kept)).replacingOccurrences(of: " ", with: "-")
+    }
+
+    /// `<img src alt>` becomes a Markdown image; `<br>` becomes a hard break.
+    static func convertInlineHTML(_ s: String) -> String {
+        guard let img = try? NSRegularExpression(pattern: "<img\\b[^>]*>", options: [.caseInsensitive]) else { return s }
+        func attribute(_ name: String, in tag: String) -> String? {
+            guard let re = try? NSRegularExpression(pattern: "\\b\(name)\\s*=\\s*\"([^\"]*)\"", options: [.caseInsensitive]),
+                  let m = re.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)),
+                  let r = Range(m.range(at: 1), in: tag) else { return nil }
+            return String(tag[r])
+        }
+        var out = s
+        for m in img.matches(in: s, range: NSRange(s.startIndex..., in: s)).reversed() {
+            guard let r = Range(m.range, in: out) else { continue }
+            let tag = String(out[r])
+            guard let src = attribute("src", in: tag) else { continue }
+            let alt = (attribute("alt", in: tag) ?? "").replacingOccurrences(of: "]", with: ")")
+            out.replaceSubrange(r, with: "![\(alt)](\(src.replacingOccurrences(of: " ", with: "%20")))")
+        }
+        return out.replacingOccurrences(of: "<br\\s*/?>", with: "  \n", options: [.regularExpression, .caseInsensitive])
+    }
+
+    static func detailsCount(in source: String) -> Int {
+        var n = 0
+        _ = expandDetails(source, open: [], counter: &n)
+        return n
+    }
+
+    /// `<details><summary>…</summary>…</details>` becomes a disclosure line. Closed blocks drop
+    /// their body. Ids count in document order whether or not a block is open, so they stay stable.
+    static func expandDetails(_ s: String, open: Set<Int>, counter: inout Int) -> String {
+        var out = ""
+        var rest = Substring(s)
+        while let start = rest.range(of: "<details", options: .caseInsensitive) {
+            out += rest[..<start.lowerBound]
+            guard let tagEnd = rest[start.upperBound...].range(of: ">") else { return out + rest[start.lowerBound...] }
+            var depth = 1
+            var cursor = tagEnd.upperBound
+            var close: Range<Substring.Index>? = nil
+            while depth > 0 {
+                guard let nextClose = rest[cursor...].range(of: "</details>", options: .caseInsensitive) else { break }
+                if let nextOpen = rest[cursor...].range(of: "<details", options: .caseInsensitive),
+                   nextOpen.lowerBound < nextClose.lowerBound {
+                    depth += 1
+                    cursor = nextOpen.upperBound
+                } else {
+                    depth -= 1
+                    cursor = nextClose.upperBound
+                    if depth == 0 { close = nextClose }
+                }
+            }
+            guard let close else { return out + rest[start.lowerBound...] }   // unbalanced: leave as written
+            var inner = String(rest[tagEnd.upperBound..<close.lowerBound])
+            var summary = "details"
+            if let so = inner.range(of: "<summary>", options: .caseInsensitive),
+               let sc = inner.range(of: "</summary>", options: .caseInsensitive), so.upperBound <= sc.lowerBound {
+                summary = String(inner[so.upperBound..<sc.lowerBound])
+                    .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                inner.removeSubrange(so.lowerBound..<sc.upperBound)
+            }
+            let id = counter
+            counter += 1
+            let bodyText = expandDetails(inner, open: open, counter: &counter)
+            let label = summary.replacingOccurrences(of: "[", with: "(").replacingOccurrences(of: "]", with: ")")
+            if open.contains(id) {
+                out += "\n\n[▾ \(label)](cyberview-toggle://\(id))\n\n" + bodyText
+                    + "\n\n[▴ close · \(label)](cyberview-toggle://\(id)/close)\n\n"
+            } else {
+                out += "\n\n[▸ \(label)](cyberview-toggle://\(id))\n\n"
+            }
+            rest = rest[close.upperBound...]
+        }
+        return out + rest
+    }
+}
+
+extension NSAttributedString.Key {
+    static let cvToggle = NSAttributedString.Key("cyberview.toggle")
+    static let cvAnchor = NSAttributedString.Key("cyberview.anchor")
+}
+
+/// The markdown page. It keeps the source so a click on a disclosure line can re-render,
+/// follows "#fragment" links to headings, and opens relative links next to the document.
+final class MarkdownTextView: NSTextView {
+    var source = ""
+    var tint: TaskTint!
+    var baseURL: URL?
+    var openDetails = Set<Int>()
+
+    func rerender() {
+        let clip = enclosingScrollView?.contentView
+        let origin = clip?.bounds.origin
+        textStorage?.setAttributedString(MarkdownRenderer.render(markdown: source, tint: tint,
+                                                                 baseURL: baseURL, open: openDetails))
+        if let lm = layoutManager, let tc = textContainer { lm.ensureLayout(for: tc) }
+        if let clip, let origin {
+            clip.scroll(to: origin)
+            enclosingScrollView?.reflectScrolledClipView(clip)
+        }
+    }
+
+    func setAllDetails(open: Bool) {
+        openDetails = open ? Set(0..<MarkdownRenderer.detailsCount(in: source)) : []
+        rerender()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if let id = toggle(at: convert(event.locationInWindow, from: nil)) {
+            if openDetails.contains(id) { openDetails.remove(id) } else { openDetails.insert(id) }
+            rerender()
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    /// A disclosure line is clickable across its whole width.
+    private func toggle(at point: NSPoint) -> Int? {
+        guard let lm = layoutManager, let tc = textContainer, let ts = textStorage, ts.length > 0 else { return nil }
+        let p = NSPoint(x: point.x - textContainerOrigin.x, y: point.y - textContainerOrigin.y)
+        let glyph = lm.glyphIndex(for: p, in: tc)
+        var lineRange = NSRange()
+        let lineRect = lm.lineFragmentRect(forGlyphAt: glyph, effectiveRange: &lineRange)
+        guard lineRect.minY <= p.y, p.y <= lineRect.maxY else { return nil }
+        let chars = lm.characterRange(forGlyphRange: lineRange, actualGlyphRange: nil)
+        guard chars.location < ts.length else { return nil }
+        return ts.attribute(.cvToggle, at: chars.location, effectiveRange: nil) as? Int
+    }
+
+    override func clicked(onLink link: Any, at charIndex: Int) {
+        guard let url = (link as? URL) ?? (link as? String).flatMap({ URL(string: $0) }) else {
+            return super.clicked(onLink: link, at: charIndex)
+        }
+        let text = url.relativeString
+        if text.hasPrefix("#") { scrollToAnchor(String(text.dropFirst())); return }
+        if url.scheme == nil, let baseURL {
+            let path = text.components(separatedBy: "#")[0]
+            let target = baseURL.appendingPathComponent(path.removingPercentEncoding ?? path).standardizedFileURL
+            if FileManager.default.fileExists(atPath: target.path) {
+                if renderers.contains(where: { $0.canRender(target) }) {
+                    AppDelegate.shared?.open(url: target)
+                } else {
+                    NSWorkspace.shared.open(target)
+                }
+                return
+            }
+        }
+        super.clicked(onLink: link, at: charIndex)
+    }
+
+    #if DEBUG
+    /// Sends a mouseDown to the right of the first disclosure line, through the normal hit-testing.
+    func selfTestClickFirstToggle() {
+        guard let ts = textStorage, let lm = layoutManager, let tc = textContainer, let window else { return }
+        var target: NSRange?
+        ts.enumerateAttribute(.cvToggle, in: NSRange(location: 0, length: ts.length)) { value, range, stop in
+            if value != nil { target = range; stop.pointee = true }
+        }
+        guard let target else { return }
+        let rect = lm.boundingRect(forGlyphRange: lm.glyphRange(forCharacterRange: target, actualCharacterRange: nil), in: tc)
+        let local = NSPoint(x: rect.maxX + textContainerOrigin.x + 120, y: rect.midY + textContainerOrigin.y)
+        if let event = NSEvent.mouseEvent(with: .leftMouseDown, location: convert(local, to: nil), modifierFlags: [],
+                                          timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                          eventNumber: 0, clickCount: 1, pressure: 1) {
+            mouseDown(with: event)
+        }
+        FileHandle.standardError.write("selftest open=\(openDetails.sorted())\n".data(using: .utf8)!)
+    }
+    #endif
+
+    private func scrollToAnchor(_ fragment: String) {
+        guard let ts = textStorage, let lm = layoutManager, let tc = textContainer,
+              let clip = enclosingScrollView?.contentView else { return }
+        let wanted = fragment.removingPercentEncoding ?? fragment
+        ts.enumerateAttribute(.cvAnchor, in: NSRange(location: 0, length: ts.length)) { value, range, stop in
+            guard let anchor = value as? String, anchor == wanted else { return }
+            let glyphs = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            let rect = lm.boundingRect(forGlyphRange: glyphs, in: tc)
+            let top = max(0, rect.minY + textContainerOrigin.y - 12)
+            let maxY = max(0, bounds.height - clip.bounds.height)
+            clip.scroll(to: NSPoint(x: 0, y: min(top, maxY)))
+            enclosingScrollView?.reflectScrolledClipView(clip)
+            stop.pointee = true
+        }
     }
 }
 
@@ -772,11 +1101,20 @@ final class ViewerController: NSWindowController, NSWindowDelegate {
     @objc func zoomActualSize(_ sender: Any?) { zoomView?.actualSize() }
     @objc func zoomToFit(_ sender: Any?) { zoomView?.fitToWindow() }
 
+    private var markdownView: MarkdownTextView? {
+        (window?.contentView as? RootView)?.content.flatMap { ($0 as? NSScrollView)?.documentView as? MarkdownTextView }
+    }
+    @objc func expandAllSections(_ sender: Any?) { markdownView?.setAllDetails(open: true) }
+    @objc func collapseAllSections(_ sender: Any?) { markdownView?.setAllDetails(open: false) }
+
     override func responds(to aSelector: Selector!) -> Bool {
         // grey out zoom menu items on non-zoomable content (markdown)
         if aSelector == #selector(zoomIn(_:)) || aSelector == #selector(zoomOut(_:))
             || aSelector == #selector(zoomActualSize(_:)) || aSelector == #selector(zoomToFit(_:)) {
             return zoomView != nil
+        }
+        if aSelector == #selector(expandAllSections(_:)) || aSelector == #selector(collapseAllSections(_:)) {
+            return (markdownView?.source.range(of: "<details", options: .caseInsensitive)) != nil
         }
         return super.responds(to: aSelector)
     }
@@ -863,6 +1201,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         viewMenu.addItem(withTitle: "Zoom Out", action: #selector(ViewerController.zoomOut(_:)), keyEquivalent: "-")
         viewMenu.addItem(withTitle: "Actual Size", action: #selector(ViewerController.zoomActualSize(_:)), keyEquivalent: "1")
         viewMenu.addItem(withTitle: "Fit to Window", action: #selector(ViewerController.zoomToFit(_:)), keyEquivalent: "0")
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(withTitle: "Expand All Sections", action: #selector(ViewerController.expandAllSections(_:)), keyEquivalent: "e")
+        let collapse = viewMenu.addItem(withTitle: "Collapse All Sections", action: #selector(ViewerController.collapseAllSections(_:)), keyEquivalent: "e")
+        collapse.keyEquivalentModifierMask = [.command, .shift]
         viewItem.submenu = viewMenu
         main.addItem(viewItem)
 

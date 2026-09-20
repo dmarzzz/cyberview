@@ -25,12 +25,30 @@ Same file, same color, forever. Different files, a wall of tinted panes.
 | drag anywhere | move |
 | drag edges | resize |
 | cmd-O | open more files |
+| cmd-E | expand every folded section (markdown) |
+| shift-cmd-E | collapse them again |
 
 ## Renderers
 
 1. **Images** — png, jpeg, gif, webp, tiff, heic, bmp
 2. **Markdown** — this document is the demo
 3. *Future* — plain text, PDF, whatever registers in `renderers`
+
+### Markdown
+
+- GFM tables draw as real grids
+- nested lists step in
+  - one level per enclosing item
+- `<details>` blocks fold: click the ▸ line to open it
+- local images render inline, scaled to the page
+- `#fragment` links jump to headings, and relative links open next to the document
+
+<details>
+<summary>a folded block</summary>
+
+Hidden until the line above is clicked.
+
+</details>
 
 > The frame is the task signifier — its color follows the file
 > and stays stable regardless of the terminal's age.
