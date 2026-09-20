@@ -240,7 +240,8 @@ struct MarkdownRenderer: Renderer {
         let baseURL = url.deletingLastPathComponent()
         var openDetails = Set<Int>()
         if ProcessInfo.processInfo.environment["CYBERVIEW_EXPAND"] != nil {
-            openDetails = Set(0..<detailsCount(in: source))
+            let info = detailsInfo(in: source)
+            openDetails = Set(0..<info.count).subtracting(info.defaultOpen)
         }
         let rendered = render(markdown: source, tint: tint, baseURL: baseURL, open: openDetails)
 
@@ -250,6 +251,12 @@ struct MarkdownRenderer: Renderer {
         textView.baseURL = baseURL
         textView.openDetails = openDetails
         #if DEBUG
+        if let fragment = ProcessInfo.processInfo.environment["CYBERVIEW_SELFTEST_ANCHOR"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                textView.clicked(onLink: URL(string: "#" + fragment) as Any, at: 0)
+                FileHandle.standardError.write("selftest anchor toggled=\(textView.openDetails.sorted())\n".data(using: .utf8)!)
+            }
+        }
         if ProcessInfo.processInfo.environment["CYBERVIEW_SELFTEST_CLICK"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { textView.selfTestClickFirstToggle() }
         }
@@ -295,9 +302,11 @@ struct MarkdownRenderer: Renderer {
     // walk the runs and dress them in terminal type: green mono body, tint
     // headings, bright code on dark boxes.
     static func render(markdown raw: String, tint: TaskTint, baseURL: URL? = nil,
-                       open: Set<Int> = []) -> NSAttributedString {
+                       open: Set<Int> = [], loadImages: Bool = true) -> NSAttributedString {
         var detailsCounter = 0
-        let source = expandDetails(convertInlineHTML(raw), open: open, counter: &detailsCounter)
+        var defaults = Set<Int>()
+        let source = expandDetails(convertInlineHTML(raw), toggled: open, counter: &detailsCounter,
+                                   defaultOpen: &defaults)
         let body = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         let bodyColor = Theme.terminalGreen.withAlphaComponent(0.88)
         let fallback: [NSAttributedString.Key: Any] = [.font: body, .foregroundColor: bodyColor]
@@ -513,7 +522,7 @@ struct MarkdownRenderer: Renderer {
             if isCodeBlock, text.hasSuffix("\n") { text.removeLast() }
 
             // local images render inline, scaled to the page
-            if let imageURL = run.imageURL {
+            if loadImages, let imageURL = run.imageURL {
                 let resolved = imageURL.scheme == nil
                     ? baseURL?.appendingPathComponent(imageURL.relativeString.removingPercentEncoding
                                                       ?? imageURL.relativeString)
@@ -549,6 +558,7 @@ struct MarkdownRenderer: Renderer {
                 // <details> disclosure line: click to fold or unfold
                 let closing = link.path == "/close"
                 attrs[.cvToggle] = id
+                if closing { attrs[.cvToggleClose] = true }
                 attrs[.cursor] = NSCursor.pointingHand
                 attrs[.foregroundColor] = tint.frame.withAlphaComponent(closing ? 0.45 : 1)
                 if !closing, let f = NSFont(descriptor: font.fontDescriptor.withSymbolicTraits(.bold),
@@ -596,15 +606,19 @@ struct MarkdownRenderer: Renderer {
         return out.replacingOccurrences(of: "<br\\s*/?>", with: "  \n", options: [.regularExpression, .caseInsensitive])
     }
 
-    static func detailsCount(in source: String) -> Int {
+    static func detailsInfo(in source: String) -> (count: Int, defaultOpen: Set<Int>) {
         var n = 0
-        _ = expandDetails(source, open: [], counter: &n)
-        return n
+        var defaults = Set<Int>()
+        _ = expandDetails(source, toggled: [], counter: &n, defaultOpen: &defaults)
+        return (n, defaults)
     }
 
     /// `<details><summary>…</summary>…</details>` becomes a disclosure line. Closed blocks drop
     /// their body. Ids count in document order whether or not a block is open, so they stay stable.
-    static func expandDetails(_ s: String, open: Set<Int>, counter: inout Int) -> String {
+    /// A block is open when its `open` attribute and its toggled state differ. A summary that holds
+    /// a heading (`<summary><h2>…</h2></summary>`) becomes a heading-sized disclosure line.
+    static func expandDetails(_ s: String, toggled: Set<Int>, counter: inout Int,
+                              defaultOpen: inout Set<Int>) -> String {
         var out = ""
         var rest = Substring(s)
         while let start = rest.range(of: "<details", options: .caseInsensitive) {
@@ -627,23 +641,31 @@ struct MarkdownRenderer: Renderer {
             }
             guard let close else { return out + rest[start.lowerBound...] }   // unbalanced: leave as written
             var inner = String(rest[tagEnd.upperBound..<close.lowerBound])
+            let tagText = String(rest[start.lowerBound..<tagEnd.upperBound])
+            let hasOpenAttribute = tagText.range(of: "\\sopen\\b", options: [.regularExpression, .caseInsensitive]) != nil
+            var headingLevel = 0
             var summary = "details"
             if let so = inner.range(of: "<summary>", options: .caseInsensitive),
                let sc = inner.range(of: "</summary>", options: .caseInsensitive), so.upperBound <= sc.lowerBound {
-                summary = String(inner[so.upperBound..<sc.lowerBound])
+                let rawSummary = String(inner[so.upperBound..<sc.lowerBound])
+                if let h = rawSummary.range(of: "<h[1-6]", options: [.regularExpression, .caseInsensitive]),
+                   let level = Int(String(rawSummary[h].last!)) { headingLevel = level }
+                summary = rawSummary
                     .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 inner.removeSubrange(so.lowerBound..<sc.upperBound)
             }
             let id = counter
             counter += 1
-            let bodyText = expandDetails(inner, open: open, counter: &counter)
+            if hasOpenAttribute { defaultOpen.insert(id) }
+            let bodyText = expandDetails(inner, toggled: toggled, counter: &counter, defaultOpen: &defaultOpen)
             let label = summary.replacingOccurrences(of: "[", with: "(").replacingOccurrences(of: "]", with: ")")
-            if open.contains(id) {
-                out += "\n\n[▾ \(label)](cyberview-toggle://\(id))\n\n" + bodyText
+            let hashes = headingLevel > 0 ? String(repeating: "#", count: headingLevel) + " " : ""
+            if hasOpenAttribute != toggled.contains(id) {
+                out += "\n\n\(hashes)[▾ \(label)](cyberview-toggle://\(id))\n\n" + bodyText
                     + "\n\n[▴ close · \(label)](cyberview-toggle://\(id)/close)\n\n"
             } else {
-                out += "\n\n[▸ \(label)](cyberview-toggle://\(id))\n\n"
+                out += "\n\n\(hashes)[▸ \(label)](cyberview-toggle://\(id))\n\n"
             }
             rest = rest[close.upperBound...]
         }
@@ -654,6 +676,7 @@ struct MarkdownRenderer: Renderer {
 extension NSAttributedString.Key {
     static let cvToggle = NSAttributedString.Key("cyberview.toggle")
     static let cvAnchor = NSAttributedString.Key("cyberview.anchor")
+    static let cvToggleClose = NSAttributedString.Key("cyberview.toggle.close")
 }
 
 /// The markdown page. It keeps the source so a click on a disclosure line can re-render,
@@ -677,7 +700,8 @@ final class MarkdownTextView: NSTextView {
     }
 
     func setAllDetails(open: Bool) {
-        openDetails = open ? Set(0..<MarkdownRenderer.detailsCount(in: source)) : []
+        let info = MarkdownRenderer.detailsInfo(in: source)
+        openDetails = open ? Set(0..<info.count).subtracting(info.defaultOpen) : info.defaultOpen
         rerender()
     }
 
@@ -745,19 +769,58 @@ final class MarkdownTextView: NSTextView {
     #endif
 
     private func scrollToAnchor(_ fragment: String) {
+        let wanted = MarkdownTextView.normalized(fragment.removingPercentEncoding ?? fragment)
+        if scrollIfPresent(wanted) { return }
+        // the heading may sit inside folded blocks: find the chain that hides it, open it, retry
+        let info = MarkdownRenderer.detailsInfo(in: source)
+        let everything = Set(0..<info.count).subtracting(info.defaultOpen)
+        let probe = MarkdownRenderer.render(markdown: source, tint: tint, baseURL: baseURL,
+                                            open: everything, loadImages: false)
+        var stack: [Int] = []
+        var chain: [Int]? = nil
+        probe.enumerateAttributes(in: NSRange(location: 0, length: probe.length)) { attrs, _, stop in
+            if let anchor = attrs[.cvAnchor] as? String, MarkdownTextView.normalized(anchor) == wanted {
+                var found = stack
+                if let own = attrs[.cvToggle] as? Int, !found.contains(own) { found.append(own) }
+                chain = found
+                stop.pointee = true
+                return
+            }
+            guard let id = attrs[.cvToggle] as? Int else { return }
+            if attrs[.cvToggleClose] != nil { if stack.last == id { stack.removeLast() } }
+            else if stack.last != id { stack.append(id) }
+        }
+        guard let chain else { return }
+        for id in chain where info.defaultOpen.contains(id) == openDetails.contains(id) {
+            // currently closed: flip it
+            if openDetails.contains(id) { openDetails.remove(id) } else { openDetails.insert(id) }
+        }
+        rerender()
+        _ = scrollIfPresent(wanted)
+    }
+
+    /// GitHub prefixes a hyphen when a heading starts with an emoji; compare without edge hyphens.
+    private static func normalized(_ slug: String) -> String {
+        slug.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    }
+
+    private func scrollIfPresent(_ wanted: String) -> Bool {
         guard let ts = textStorage, let lm = layoutManager, let tc = textContainer,
-              let clip = enclosingScrollView?.contentView else { return }
-        let wanted = fragment.removingPercentEncoding ?? fragment
+              let clip = enclosingScrollView?.contentView else { return false }
+        var found = false
         ts.enumerateAttribute(.cvAnchor, in: NSRange(location: 0, length: ts.length)) { value, range, stop in
-            guard let anchor = value as? String, anchor == wanted else { return }
+            guard let anchor = value as? String, MarkdownTextView.normalized(anchor) == wanted else { return }
+            lm.ensureLayout(for: tc)
             let glyphs = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
             let rect = lm.boundingRect(forGlyphRange: glyphs, in: tc)
             let top = max(0, rect.minY + textContainerOrigin.y - 12)
             let maxY = max(0, bounds.height - clip.bounds.height)
             clip.scroll(to: NSPoint(x: 0, y: min(top, maxY)))
             enclosingScrollView?.reflectScrolledClipView(clip)
+            found = true
             stop.pointee = true
         }
+        return found
     }
 }
 

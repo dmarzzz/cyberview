@@ -40,6 +40,8 @@ Same file, same color, forever. Different files, a wall of tinted panes.
 - nested lists step in
   - one level per enclosing item
 - `<details>` blocks fold: click the ▸ line to open it
+  - `<details open>` starts open, and `<summary><h2>…</h2></summary>` folds a whole section under a heading-sized line
+  - a `#fragment` link into a folded section opens it first
 - local images render inline, scaled to the page
 - `#fragment` links jump to headings, and relative links open next to the document
 
